@@ -8,7 +8,7 @@ namespace PRReviewBot.Application.Models.Common
         public string FilePath { get; set; } = string.Empty;
         [JsonPropertyName("className")]
         public string ClassName { get; set; } = string.Empty;
-        [JsonPropertyName("line")]
+        [JsonPropertyName("lineNumber")]
         public int LineNumber { get; set; }
         [JsonPropertyName("side")]
         public string Side { get; set; } = "RIGHT";
@@ -18,8 +18,8 @@ namespace PRReviewBot.Application.Models.Common
         public string Issue { get; set; } = string.Empty;
         [JsonPropertyName("recommendation")]
         public string Recommendation { get; set; }=string.Empty;
-        [JsonPropertyName("suggestedFix")]
-        public string? PossibleFix { get; set; }
+        [JsonPropertyName("possibleFix")]
+        public string? SuggestedFix { get; set; }
 
     }
 }
