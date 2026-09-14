@@ -1,74 +1,11 @@
-﻿using PRReviewBot.Application.Interfaces;
-using PRReviewBot.Application.Models.Common;
-using System.Text.Json;
+﻿using PRReviewBot.Application.Models.Common;
 using System.Text;
 
-namespace PRReviewBot.Application.Services
+namespace PRReviewBot.Infrastructure.AI
 {
-    public class PRReviewService : IPRReviewService
+    public static class AIReviewPromptBuilder
     {
-        private readonly IAIServiceFactory aIServiceFactory;
-        private readonly IGitHubService _gitHubService;
-
-        public PRReviewService(
-            IAIServiceFactory aIServiceFactory,
-            IGitHubService gitHubService)
-        {
-            this.aIServiceFactory = aIServiceFactory;
-            this._gitHubService = gitHubService;
-        }
-
-        public async Task<AIReviewResponse> ReviewPullRequestAsync(
-            string pullRequestUrl,
-            CancellationToken cancellationToken = default)
-        {
-            if (string.IsNullOrWhiteSpace(pullRequestUrl))
-            {
-                throw new ArgumentException("Pull request URL cannot be null or empty.", nameof(pullRequestUrl));
-            }
-
-            // ---------------------------------------------
-            // 1. Get PR metadata and diff from GitHub
-            // ---------------------------------------------
-
-            var pullRequest =
-                await _gitHubService.GetPullRequestAsync(
-                    pullRequestUrl,
-                    cancellationToken);
-
-            if (string.IsNullOrWhiteSpace(pullRequest?.Diff))
-            {
-                return new AIReviewResponse();
-            }
-
-            //2. Select Gemini or OpenAI or azureOpenId based on configuration
-
-            var aiService = aIServiceFactory.Create();
-
-            //3. Send the PR diff to the selected AI Provider for review
-
-            var aiResult = await aiService.ReviewCodeAsync(
-                pullRequest,
-                cancellationToken);
-
-            //4. Post findings as comments to the PR on GitHub
-            if(aiResult.Findings.Count>0)
-            {
-                await _gitHubService.AddReviewCommentsAsync(
-                    pullRequest,
-                    aiResult.Findings,
-                    cancellationToken);
-            }
-
-            return aiResult;
-
-        }
-
-        // =================================================
-        // Build Prompt
-        // =================================================
-
-        private static string BuildReviewPrompt(PullRequestData pullRequest)
+        public static string BuildReviewPrompt(PullRequestData pullRequest)
         {
             var sb = new StringBuilder();
             sb.AppendLine("You are an experienced senior software engineer");
@@ -164,53 +101,6 @@ namespace PRReviewBot.Application.Services
             sb.AppendLine("8. Do not invent file names or line numbers.");
 
             return sb.ToString();
-        }
-
-        // =================================================
-        // Deserialize Gemini Response
-        // =================================================
-
-        private static PRReviewResult DeserializeReview(string content)
-        {
-            var json = ExtractJson(content);
-
-            var result = JsonSerializer.Deserialize<PRReviewResult>(
-                json,
-                new JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                });
-
-            if (result is null)
-            {
-                throw new InvalidOperationException(
-                    "AI response could not be converted to PRReviewResult.");
-            }
-
-            return result;
-        }
-
-        // =================================================
-        // Gemini sometimes returns ```json ... ```
-        // =================================================
-
-        private static string ExtractJson(string content)
-        {
-            content = content.Trim();
-
-            if (content.StartsWith("```"))
-            {
-                var firstNewLine = content.IndexOf('\n');
-
-                var lastFence = content.LastIndexOf("```", StringComparison.Ordinal);
-
-                if (firstNewLine >= 0 && lastFence > firstNewLine)
-                {
-                    content = content.Substring(firstNewLine + 1, lastFence - firstNewLine - 1);
-                }
-            }
-
-            return content.Trim();
         }
     }
 }

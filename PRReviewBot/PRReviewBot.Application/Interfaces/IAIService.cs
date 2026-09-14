@@ -4,6 +4,6 @@ namespace PRReviewBot.Application.Interfaces
 {
     public interface IAIService
     {
-        Task<AIResult> GenerateAsync(string prompt, CancellationToken cancellationToken = default);
+        Task<AIReviewResponse> ReviewCodeAsync(PullRequestData pullRequest, CancellationToken cancellationToken = default);
     }
 }

@@ -1,11 +1,12 @@
-﻿using PRReviewBot.Application.Interfaces;
-using PRReviewBot.Application.Models;
-using PRReviewBot.Application.Models.Common;
-using System.Net.Http.Json;
+﻿using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Text.RegularExpressions;
+
+using PRReviewBot.Application.Interfaces;
+using PRReviewBot.Application.Models;
+using PRReviewBot.Application.Models.Common;
 
 namespace PRReviewBot.Infrastructure.GitHub;
 
@@ -24,87 +25,174 @@ public sealed class GitHubService : IGitHubService
         };
     }
 
+    // ============================================================
+    // Get pull request metadata and diff
+    // ============================================================
+
     public async Task<PullRequestData> GetPullRequestAsync(
     string pullRequestUrl,
-    CancellationToken cancellationToken)
+    CancellationToken cancellationToken = default)
     {
-        var uri = new Uri(pullRequestUrl);
+        if (string.IsNullOrWhiteSpace(pullRequestUrl))
+        {
+            throw new ArgumentException(
+            "GitHub pull request URL is required.",
+            nameof(pullRequestUrl));
+        }
 
-        var segments = uri.AbsolutePath
-        .Split('/', StringSplitOptions.RemoveEmptyEntries);
-
-        if (segments.Length < 4 ||
-        !segments[2].Equals("pull", StringComparison.OrdinalIgnoreCase) &&
-        !segments[2].Equals("pulls", StringComparison.OrdinalIgnoreCase))
+        if (!Uri.TryCreate(
+        pullRequestUrl,
+        UriKind.Absolute,
+        out var uri))
         {
             throw new ArgumentException(
             "Invalid GitHub pull request URL.",
             nameof(pullRequestUrl));
         }
 
-        var owner = segments[0];
-        var repository = segments[1];
-        var pullNumber = int.Parse(segments[3]);
+        var segments = uri.AbsolutePath
+        .Split(
+        '/',
+        StringSplitOptions.RemoveEmptyEntries);
 
-        var endpoint =
-        $"repos/{owner}/{repository}/pulls/{pullNumber}";
+        /*
+        * Expected URL:
+        *
+        * https://github.com/{owner}/{repository}/pull/{number}
+        *
+        * Also accepts /pulls/{number}.
+        */
 
-        using var response = await _httpClient.GetAsync(
-        endpoint,
-        cancellationToken);
-
-        response.EnsureSuccessStatusCode();
-
-        var json = await response.Content.ReadAsStringAsync(
-        cancellationToken);
-
-        var githubResponse =
-        JsonSerializer.Deserialize<GitHubPullRequestResponse>(
-        json,
-        _jsonOptions)
-        ?? throw new InvalidOperationException(
-        "Unable to deserialize GitHub PR response.");
-
-        if (string.IsNullOrWhiteSpace(githubResponse.Head.Sha))
+        if (segments.Length < 4 ||
+        (!segments[2].Equals(
+        "pull",
+        StringComparison.OrdinalIgnoreCase) &&
+        !segments[2].Equals(
+        "pulls",
+        StringComparison.OrdinalIgnoreCase)) ||
+        !int.TryParse(
+        segments[3],
+        out var pullRequestNumber))
         {
-            throw new InvalidOperationException(
-            "GitHub PR head SHA was not returned.");
+            throw new ArgumentException(
+            "Invalid GitHub pull request URL. " +
+            "Expected format: " +
+            "https://github.com/{owner}/{repository}/pull/{number}",
+            nameof(pullRequestUrl));
         }
 
-        var diffEndpoint =
-        $"repos/{owner}/{repository}/pulls/{pullNumber}";
+        var owner = Uri.UnescapeDataString(segments[0]);
+        var repository = Uri.UnescapeDataString(segments[1]);
 
-        using var diffRequest = new HttpRequestMessage(
-        HttpMethod.Get,
-        diffEndpoint);
+        var pullRequestEndpoint =
+        $"repos/{owner}/{repository}/pulls/{pullRequestNumber}";
 
-        diffRequest.Headers.Accept.ParseAdd(
-        "application/vnd.github.v3.diff");
+        // --------------------------------------------------------
+        // Get pull request metadata
+        // --------------------------------------------------------
 
-        using var diffResponse = await _httpClient.SendAsync(
-        diffRequest,
+        using var pullRequestResponse =
+        await SendGetRequestAsync(
+        pullRequestEndpoint,
+        "application/vnd.github+json",
         cancellationToken);
 
-        diffResponse.EnsureSuccessStatusCode();
+        var pullRequestJson =
+        await pullRequestResponse.Content.ReadAsStringAsync(
+        cancellationToken);
 
-        var diff = await diffResponse.Content.ReadAsStringAsync(
+        var githubPullRequest =
+        JsonSerializer.Deserialize<GitHubPullRequestResponse>(
+        pullRequestJson,
+        _jsonOptions);
+
+        if (githubPullRequest is null)
+        {
+            throw new InvalidOperationException(
+            "Unable to deserialize the GitHub pull request response.");
+        }
+
+        if (githubPullRequest.Head is null ||
+        string.IsNullOrWhiteSpace(
+        githubPullRequest.Head.Sha))
+        {
+            throw new InvalidOperationException(
+            "GitHub did not return a valid pull request head SHA.");
+        }
+
+        var headSha = githubPullRequest.Head.Sha;
+
+        // --------------------------------------------------------
+        // Get pull request diff
+        // --------------------------------------------------------
+
+        using var diffResponse =
+        await SendGetRequestAsync(
+        pullRequestEndpoint,
+        "application/vnd.github.v3.diff",
+        cancellationToken);
+
+        var diff =
+        await diffResponse.Content.ReadAsStringAsync(
         cancellationToken);
 
         return new PullRequestData
         {
             Owner = owner,
             Repository = repository,
-            PullRequestNumber = pullNumber,
-            HeadSha = githubResponse.Head.Sha,
+            PullRequestNumber = pullRequestNumber,
+            HeadSha = headSha,
             Diff = diff
         };
     }
 
+    // ============================================================
+    // Add inline review comments
+    // ============================================================
+
     public async Task AddReviewCommentsAsync(
     PullRequestData pullRequest,
     IEnumerable<ReviewFinding> findings,
-    CancellationToken cancellationToken)
+    CancellationToken cancellationToken = default)
     {
+        if (pullRequest is null)
+        {
+            throw new ArgumentNullException(nameof(pullRequest));
+        }
+
+        if (string.IsNullOrWhiteSpace(pullRequest.Owner))
+        {
+            throw new ArgumentException(
+            "Pull request owner is missing.",
+            nameof(pullRequest));
+        }
+
+        if (string.IsNullOrWhiteSpace(pullRequest.Repository))
+        {
+            throw new ArgumentException(
+            "Pull request repository is missing.",
+            nameof(pullRequest));
+        }
+
+        if (pullRequest.PullRequestNumber <= 0)
+        {
+            throw new ArgumentException(
+            "Pull request number is invalid.",
+            nameof(pullRequest));
+        }
+
+        if (string.IsNullOrWhiteSpace(pullRequest.HeadSha))
+        {
+            throw new InvalidOperationException(
+            "Pull request head SHA is empty. " +
+            "GitHub requires a valid commit SHA when creating a review.");
+        }
+
+        if (findings is null)
+        {
+            return;
+        }
+
         var validFindings = findings
         .Where(IsValidFinding)
         .ToList();
@@ -114,171 +202,346 @@ public sealed class GitHubService : IGitHubService
             return;
         }
 
+        // --------------------------------------------------------
+        // Retrieve existing comments
+        // --------------------------------------------------------
+
         var existingComments =
         await GetExistingCommentsAsync(
         pullRequest,
         cancellationToken);
 
-        var existingKeys = existingComments
-        .Where(IsBotComment)
-        .Select(comment => CreateExistingCommentKey(
-        comment,
-        pullRequest.HeadSha))
-        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var newComments =
+        new List<GitHubReviewCommentRequest>();
 
-        var commentsToPost = new List<GitHubReviewComment>();
+        var alreadyProcessedMarkers =
+        new HashSet<string>(
+        StringComparer.Ordinal);
+
+        // --------------------------------------------------------
+        // Filter duplicate findings
+        // --------------------------------------------------------
 
         foreach (var finding in validFindings)
         {
-            var key = CreateFindingKey(
+            var marker =
+            CreateCommentMarker(
             finding,
             pullRequest.HeadSha);
 
-            if (existingKeys.Contains(key))
+            // Avoid duplicate findings within the same AI response.
+            if (!alreadyProcessedMarkers.Add(marker))
             {
                 continue;
             }
 
-            commentsToPost.Add(new GitHubReviewComment
-            {
-                Body = BuildReviewComment(finding),
-                Path = finding.FilePath,
-                Line = finding.LineNumber,
-                Side = finding.Side
-            });
+            // Avoid comments already posted by this bot for the same finding.
+            // We match using the finding fingerprint so that comments created
+            // on earlier commits (different head SHA) are still detected and
+            // prevent reposting the same finding when it has not been fixed.
+            var fingerprint = CreateFindingFingerprint(finding);
 
-            existingKeys.Add(key);
+            var commentAlreadyExists =
+            existingComments.Any(
+            existingComment =>
+            !string.IsNullOrWhiteSpace(
+            existingComment.Body) &&
+            existingComment.Body.Contains(
+            fingerprint,
+            StringComparison.OrdinalIgnoreCase));
+
+            if (commentAlreadyExists)
+            {
+                continue;
+            }
+
+            var side = NormalizeSide(finding.Side);
+
+            newComments.Add(
+            new GitHubReviewCommentRequest
+            {
+                Body = BuildReviewComment(
+            finding,
+            pullRequest.HeadSha),
+
+                Path = finding.FilePath.Trim(),
+
+                Line = finding.LineNumber,
+
+                Side = side
+            });
         }
 
-        if (commentsToPost.Count == 0)
+        // No new comments need to be posted.
+        if (newComments.Count == 0)
         {
             return;
         }
 
-        var reviewRequest = new GitHubReviewRequest
+        // --------------------------------------------------------
+        // Create one review containing all new comments
+        // --------------------------------------------------------
+
+        var reviewRequest =
+        new GitHubReviewRequest
         {
+            Body = "🤖 AI Code Review",
             CommitId = pullRequest.HeadSha,
             Event = "COMMENT",
-            Body = "🤖 AI Code Review",
-            Comments = commentsToPost
+            Comments = newComments
         };
 
-        using var response = await _httpClient.PostAsJsonAsync(
-        $"repos/{pullRequest.Owner}/{pullRequest.Repository}" +
-        $"/pulls/{pullRequest.PullRequestNumber}/reviews",
+        var endpoint =
+        $"repos/{pullRequest.Owner}/" +
+        $"{pullRequest.Repository}/" +
+        $"pulls/{pullRequest.PullRequestNumber}/reviews";
+
+        var requestJson =
+        JsonSerializer.Serialize(
         reviewRequest,
-        _jsonOptions,
+        _jsonOptions);
+
+        using var request =
+        new HttpRequestMessage(
+        HttpMethod.Post,
+        endpoint);
+
+        request.Headers.Accept.Clear();
+
+        request.Headers.Accept.Add(
+        new MediaTypeWithQualityHeaderValue(
+        "application/vnd.github+json"));
+
+        request.Content =
+        new StringContent(
+        requestJson,
+        Encoding.UTF8,
+        "application/json");
+
+        using var response =
+        await _httpClient.SendAsync(
+        request,
+        cancellationToken);
+
+        var responseBody =
+        await response.Content.ReadAsStringAsync(
         cancellationToken);
 
         if (!response.IsSuccessStatusCode)
         {
-            var error = await response.Content.ReadAsStringAsync(
-            cancellationToken);
-
             throw new HttpRequestException(
             $"GitHub review creation failed. " +
-            $"Status: {response.StatusCode}. " +
-            $"Details: {error}");
+            $"Status: {(int)response.StatusCode} " +
+            $"{response.ReasonPhrase}. " +
+            $"Response: {responseBody}");
         }
     }
+
+    // ============================================================
+    // Get existing pull request review comments
+    // ============================================================
 
     private async Task<List<GitHubExistingComment>>
     GetExistingCommentsAsync(
     PullRequestData pullRequest,
     CancellationToken cancellationToken)
     {
-        var endpoint =
-        $"repos/{pullRequest.Owner}/{pullRequest.Repository}" +
-        $"/pulls/{pullRequest.PullRequestNumber}/comments";
+        var allComments =
+        new List<GitHubExistingComment>();
 
-        using var response = await _httpClient.GetAsync(
-        endpoint,
+        const int pageSize = 100;
+
+        var pageNumber = 1;
+
+        while (true)
+        {
+            var endpoint =
+            $"repos/{pullRequest.Owner}/" +
+            $"{pullRequest.Repository}/" +
+            $"pulls/{pullRequest.PullRequestNumber}/comments" +
+            $"?per_page={pageSize}&page={pageNumber}";
+
+            using var response =
+            await SendGetRequestAsync(
+            endpoint,
+            "application/vnd.github+json",
+            cancellationToken);
+
+            var json =
+            await response.Content.ReadAsStringAsync(
+            cancellationToken);
+
+            var pageComments =
+            JsonSerializer.Deserialize<
+            List<GitHubExistingComment>>(
+            json,
+            _jsonOptions)
+            ?? new List<GitHubExistingComment>();
+
+            if (pageComments.Count == 0)
+            {
+                break;
+            }
+
+            allComments.AddRange(pageComments);
+
+            if (pageComments.Count < pageSize)
+            {
+                break;
+            }
+
+            pageNumber++;
+        }
+
+        return allComments;
+    }
+
+    // ============================================================
+    // Send GET request
+    // ============================================================
+
+    private async Task<HttpResponseMessage>
+    SendGetRequestAsync(
+    string endpoint,
+    string acceptHeader,
+    CancellationToken cancellationToken)
+    {
+        using var request =
+        new HttpRequestMessage(
+        HttpMethod.Get,
+        endpoint);
+
+        request.Headers.Accept.Clear();
+
+        request.Headers.Accept.Add(
+        new MediaTypeWithQualityHeaderValue(
+        acceptHeader));
+
+        var response =
+        await _httpClient.SendAsync(
+        request,
         cancellationToken);
 
-        response.EnsureSuccessStatusCode();
-
-        var json = await response.Content.ReadAsStringAsync(
+        var responseBody =
+        await response.Content.ReadAsStringAsync(
         cancellationToken);
 
-        return JsonSerializer.Deserialize<
-        List<GitHubExistingComment>>(
-        json,
-        _jsonOptions) ?? new List<GitHubExistingComment>();
+        if (!response.IsSuccessStatusCode)
+        {
+            response.Dispose();
+
+            throw new HttpRequestException(
+            $"GitHub GET request failed. " +
+            $"Status: {(int)response.StatusCode} " +
+            $"{response.ReasonPhrase}. " +
+            $"Response: {responseBody}");
+        }
+
+        return response;
     }
 
-    private static bool IsValidFinding(ReviewFinding finding)
+    // ============================================================
+    // Validate AI finding
+    // ============================================================
+
+    private static bool IsValidFinding(
+    ReviewFinding finding)
     {
-        return !string.IsNullOrWhiteSpace(finding.FilePath)
-        && finding.LineNumber > 0
-        && !string.IsNullOrWhiteSpace(finding.Issue);
+        if (finding is null)
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(
+        finding.FilePath))
+        {
+            return false;
+        }
+
+        if (finding.LineNumber <= 0)
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(
+        finding.Issue))
+        {
+            return false;
+        }
+
+        return true;
     }
 
-    private static bool IsBotComment(
-    GitHubExistingComment comment)
+    // ============================================================
+    // Normalize GitHub comment side
+    // ============================================================
+
+    private static string NormalizeSide(
+    string? side)
     {
-        return comment.Body.Contains(
-        "PRReviewBot",
-        StringComparison.OrdinalIgnoreCase);
+        return string.Equals(
+        side,
+        "LEFT",
+        StringComparison.OrdinalIgnoreCase)
+        ? "LEFT"
+        : "RIGHT";
     }
 
-    private static string CreateFindingKey(
+    // ============================================================
+    // Create unique finding marker
+    // ============================================================
+
+    private static string CreateCommentMarker(
     ReviewFinding finding,
     string headSha)
     {
-        return string.Join(
-        "|",
-        headSha.Trim().ToLowerInvariant(),
-        finding.FilePath.Trim().ToLowerInvariant(),
-        finding.LineNumber,
-        finding.Issue.Trim().ToLowerInvariant());
+        var fingerprint =
+        CreateFindingFingerprint(finding);
+
+        return
+        $"<!-- PRReviewBot:{headSha}:{fingerprint} -->";
     }
 
-    private static string CreateExistingCommentKey(
-    GitHubExistingComment comment,
-    string headSha)
-    {
-        return string.Join(
-        "|",
-        headSha.Trim().ToLowerInvariant(),
-        comment.Path.Trim().ToLowerInvariant(),
-        comment.Line ?? 0,
-        ExtractIssue(comment.Body).Trim().ToLowerInvariant());
-    }
+    // ============================================================
+    // Create SHA-256 fingerprint for a finding
+    // ============================================================
 
-    private static string ExtractIssue(string body)
-    {
-        const string start = "**Issue:**";
-
-        var index = body.IndexOf(
-        start,
-        StringComparison.OrdinalIgnoreCase);
-
-        if (index < 0)
-        {
-            return body;
-        }
-
-        var issue = body[(index + start.Length)..];
-
-        var recommendationIndex = issue.IndexOf(
-        "**Recommendation:**",
-        StringComparison.OrdinalIgnoreCase);
-
-        if (recommendationIndex >= 0)
-        {
-            issue = issue[..recommendationIndex];
-        }
-
-        return issue.Trim();
-    }
-
-    private static string BuildReviewComment(
+    private static string CreateFindingFingerprint(
     ReviewFinding finding)
     {
-        return $"""
-<!-- PRReviewBot -->
+        var canonicalValue =
+        $"{finding.FilePath.Trim().ToLowerInvariant()}|" +
+        $"{finding.LineNumber}|" +
+        $"{finding.Issue.Trim().ToLowerInvariant()}";
 
-🤖 **AI Code Review — {finding.Severity}**
+        var inputBytes =
+        Encoding.UTF8.GetBytes(canonicalValue);
+
+        var hashBytes =
+        SHA256.HashData(inputBytes);
+
+        return Convert.ToHexString(hashBytes);
+    }
+
+    // ============================================================
+    // Build GitHub comment body
+    // ============================================================
+
+    private static string BuildReviewComment(
+    ReviewFinding finding,
+    string headSha)
+    {
+        var marker =
+        CreateCommentMarker(
+        finding,
+        headSha);
+
+        return $"""
+{marker}
+
+🤖 **AI Code Review**
+
+**Severity:** {finding.Severity}
 
 **Class:** {finding.ClassName}
 
@@ -291,83 +554,72 @@ public sealed class GitHubService : IGitHubService
 **Suggested Fix:**
 {finding.SuggestedFix ?? "No specific fix suggested."}
 
-_Generated by PRReviewBot_
+---
+Generated by PRReviewBot
 """;
     }
 
-
-    // =================================================
-    // GitHub Response Models
-    // =================================================
+    // ============================================================
+    // GitHub response/request models
+    // ============================================================
 
     private sealed class GitHubPullRequestResponse
     {
-        [JsonPropertyName("title")]
-        public string? Title { get; set; }
-
-        [JsonPropertyName("body")]
-        public string? Body { get; set; }
-
         [JsonPropertyName("head")]
-        public GitHubPullRequestHead Head { get; set; }
+        public GitHubPullRequestHead? Head { get; set; }
     }
 
     private sealed class GitHubPullRequestHead
     {
         [JsonPropertyName("sha")]
-        public string? Sha { get; set; } = string.Empty;
-
-        [JsonPropertyName("ref")]
-        public string Ref { get; set; } = string.Empty;
+        public string? Sha { get; set; }
     }
-
-    // =================================================
-    // GitHub Review Request
-    // =================================================
 
     private sealed class GitHubReviewRequest
     {
+        [JsonPropertyName("body")]
+        public string Body { get; set; } = string.Empty;
+
         [JsonPropertyName("commit_id")]
         public string CommitId { get; set; } = string.Empty;
-        [JsonPropertyName("body")]
-        public string Body { get; set; } = string.Empty;
+
         [JsonPropertyName("event")]
         public string Event { get; set; } = "COMMENT";
+
         [JsonPropertyName("comments")]
-        public List<GitHubReviewComment> Comments { get; set; } = new List<GitHubReviewComment>();
+        public List<GitHubReviewCommentRequest> Comments { get; set; } = [];
     }
 
-    // =================================================
-    // GitHub Review Comment
-    // =================================================
-
-    private sealed class GitHubReviewComment
+    private sealed class GitHubReviewCommentRequest
     {
-        [JsonPropertyName("path")]
-        public string Path { get; set; } = string.Empty;
-        [JsonPropertyName("line")]
-        public int Line { get; set; }
-        [JsonPropertyName("side")]
-        public string Side { get; set; } = "RIGHT";
         [JsonPropertyName("body")]
         public string Body { get; set; } = string.Empty;
+
+        [JsonPropertyName("path")]
+        public string Path { get; set; } = string.Empty;
+
+        [JsonPropertyName("line")]
+        public int Line { get; set; }
+
+        [JsonPropertyName("side")]
+        public string Side { get; set; } = "RIGHT";
     }
+
     private sealed class GitHubExistingComment
     {
         [JsonPropertyName("body")]
-        public string Body { get; set; } = string.Empty;
+        public string? Body { get; set; }
+
         [JsonPropertyName("path")]
-        public string Path { get; set; } = string.Empty;
+        public string? Path { get; set; }
+
         [JsonPropertyName("line")]
         public int? Line { get; set; }
+
         [JsonPropertyName("side")]
         public string? Side { get; set; }
-        [JsonPropertyName("commit_id")]
-        public string CommitId { get; set; } = string.Empty;
 
+        [JsonPropertyName("commit_id")]
+        public string? CommitId { get; set; }
     }
-    private sealed record PullRequestInfo(
-    string Owner,
-    string Repository,
-    int Number);
 }

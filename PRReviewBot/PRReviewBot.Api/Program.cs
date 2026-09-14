@@ -5,6 +5,9 @@ using PRReviewBot.Application.Services;
 using PRReviewBot.Infrastructure.AI;
 using PRReviewBot.Infrastructure.Configiration;
 using PRReviewBot.Infrastructure.Configuration;
+using PRReviewBot.Infrastructure.Factories;
+
+
 
 // using PRReviewBot.Infrastructure.Configiration; // removed to avoid GeminiOptions ambiguity
 using PRReviewBot.Infrastructure.GitHub;
@@ -17,33 +20,48 @@ builder.Services.AddOptions<GithubOptions>()
     .Validate(o => !string.IsNullOrEmpty(o.Token), "Token is required")
     .ValidateOnStart();
 builder.Services.Configure<GithubOptions>(builder.Configuration.GetSection(GithubOptions.SectionName));
-
+builder.Services.AddHttpClient<GeminiService>();
+builder.Services.AddHttpClient<OpenAIService>();
+builder.Services.AddHttpClient<AzureOpenAIService>();
+builder.Services.AddScoped<IAIServiceFactory, AIServiceFactory>();
 builder.Services.AddControllers();
 builder.Services.AddScoped<IPRReviewService, PRReviewService>();
-
 builder.Services.AddHttpClient<IGitHubService, GitHubService>(
-(serviceProvider,client) =>
+(serviceProvider, client) =>
 {
-    var options=serviceProvider.GetRequiredService<IOptions<GithubOptions>>().Value;
+    var options = serviceProvider.GetRequiredService<IOptions<GithubOptions>>().Value;
     client.BaseAddress = new Uri("https://api.github.com/");
     client.DefaultRequestHeaders.Accept.Add(
     new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
     client.DefaultRequestHeaders.UserAgent.ParseAdd("PRReviewBot");
     client.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2026-03-10");
-    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer",options.Token);
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", options.Token);
 });
 
-builder.Services.AddOptions<GeminiOptions>()
-    .Bind(builder.Configuration.GetSection(GeminiOptions.SectionName))
-    .Validate(o => !string.IsNullOrEmpty(o.ApiKey), "ApiKey is required")
+builder.Services.AddOptions<AIOptions>()
+    .Bind(builder.Configuration.GetSection(AIOptions.SectionName))
+    .Validate(o => o.Provider switch
+    {
+        PRReviewBot.Application.Enums.AIProvider.Gemini =>
+            !string.IsNullOrWhiteSpace(o.Gemini.ApiKey) &&
+            !string.IsNullOrWhiteSpace(o.Gemini.Model),
+        PRReviewBot.Application.Enums.AIProvider.OpenAI =>
+            !string.IsNullOrWhiteSpace(o.OpenAI.ApiKey) &&
+            !string.IsNullOrWhiteSpace(o.OpenAI.Model),
+        PRReviewBot.Application.Enums.AIProvider.AzureOpenAI =>
+          !string.IsNullOrWhiteSpace(o.AzureOpenAI.Endpoint) &&
+          !string.IsNullOrWhiteSpace(o.AzureOpenAI.ApiKey) &&
+          !string.IsNullOrWhiteSpace(o.AzureOpenAI.DeploymentName),
+        _ => false
+    }, "Invalid AI provider or missing API key")
     .ValidateOnStart();
-builder.Services.Configure<GeminiOptions>(builder.Configuration.GetSection(GeminiOptions.SectionName));
+builder.Services.Configure<AIOptions>(builder.Configuration.GetSection(AIOptions.SectionName));
 
 
-builder.Services.AddHttpClient<IAIService, GeminiService>((serviceProvider, client) =>
+builder.Services.AddHttpClient<GeminiService>((serviceProvider, httpClient) =>
 {
-    var options = serviceProvider.GetRequiredService<IOptions<GeminiOptions>>().Value;
-    client.BaseAddress = new Uri(options.BaseUrl);
+    var options = serviceProvider.GetRequiredService<IOptions<AIOptions>>().Value;
+    httpClient.BaseAddress = new Uri(options.Gemini.BaseUrl);
 })
 .AddStandardResilienceHandler(options =>
 {

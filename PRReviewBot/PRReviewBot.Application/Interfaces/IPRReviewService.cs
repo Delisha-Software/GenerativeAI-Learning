@@ -4,7 +4,7 @@ namespace PRReviewBot.Application.Interfaces
 {
     public interface IPRReviewService
     {
-        Task<AIResult> ReviewPullRequestAsync(
+        Task<AIReviewResponse> ReviewPullRequestAsync(
           string pullRequestUrl,
           CancellationToken cancellationToken = default);
 

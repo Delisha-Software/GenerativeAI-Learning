@@ -21,7 +21,7 @@ namespace PRReviewBot.Api.Controllers
         }
 
         [HttpPost("review")]
-        public async Task<IActionResult> Review([FromBody] ReviewRequest request, CancellationToken cancellationToken = default)
+        public async Task<IActionResult> ReviewPullRequest([FromBody] ReviewRequest request, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(request?.PullRequestUrl))
             {
@@ -30,17 +30,21 @@ namespace PRReviewBot.Api.Controllers
             try
             {
                 var reviewResult = await _prReviewService.ReviewPullRequestAsync(request.PullRequestUrl, cancellationToken);
-
-                if (!reviewResult.IsSuccess)
-                {
-                    return StatusCode(StatusCodes.Status502BadGateway, reviewResult);
-                }
                 return Ok(reviewResult);
+            }
+            catch(ArgumentException ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+            catch (HttpRequestException ex)
+            {
+                return StatusCode(StatusCodes.Status502BadGateway, $"Error communicating with GitHub: {ex.Message}");
             }
             catch (Exception ex)
             {
                 return StatusCode(StatusCodes.Status500InternalServerError, $"An error occurred while reviewing the pull request: {ex.Message}");
             }
+           
         }
     }
 }

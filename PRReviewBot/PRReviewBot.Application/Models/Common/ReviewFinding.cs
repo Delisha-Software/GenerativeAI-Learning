@@ -8,7 +8,7 @@ namespace PRReviewBot.Application.Models.Common
         public string FilePath { get; set; } = string.Empty;
         [JsonPropertyName("className")]
         public string ClassName { get; set; } = string.Empty;
-        [JsonPropertyName("lineNumber")]
+        [JsonPropertyName("LineNumber")]
         public int LineNumber { get; set; }
         [JsonPropertyName("side")]
         public string Side { get; set; } = "RIGHT";
