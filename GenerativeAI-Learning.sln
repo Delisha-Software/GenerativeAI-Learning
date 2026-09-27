@@ -2,7 +2,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 18
 VisualStudioVersion = 18.0.0.0
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AIHelloWorld-Console", "AIHelloWorld-Console\AIHelloWorld-Console.csproj", "{1D3F9A0B-8C2E-4B6A-9F3E-1234567890AB}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AIHelloWorld.Console", "AIHelloWorld-Console\AIHelloWorld.Console.csproj", "{1D3F9A0B-8C2E-4B6A-9F3E-1234567890AB}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -17,5 +17,8 @@ Global
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {B86FA77B-58FB-48BA-8417-E1D07A30EAC2}
 	EndGlobalSection
 EndGlobal
