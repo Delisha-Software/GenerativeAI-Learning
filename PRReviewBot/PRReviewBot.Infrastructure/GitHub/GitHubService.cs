@@ -1,12 +1,11 @@
-﻿using System.Net.Http.Headers;
+﻿using PRReviewBot.Application.Interfaces;
+using PRReviewBot.Application.Models;
+using PRReviewBot.Application.Models.Common;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-
-using PRReviewBot.Application.Interfaces;
-using PRReviewBot.Application.Models;
-using PRReviewBot.Application.Models.Common;
 
 namespace PRReviewBot.Infrastructure.GitHub;
 
@@ -50,18 +49,9 @@ public sealed class GitHubService : IGitHubService
             nameof(pullRequestUrl));
         }
 
-        var segments = uri.AbsolutePath
-        .Split(
+        var segments = uri.AbsolutePath.Split(
         '/',
         StringSplitOptions.RemoveEmptyEntries);
-
-        /*
-        * Expected URL:
-        *
-        * https://github.com/{owner}/{repository}/pull/{number}
-        *
-        * Also accepts /pulls/{number}.
-        */
 
         if (segments.Length < 4 ||
         (!segments[2].Equals(
@@ -88,7 +78,7 @@ public sealed class GitHubService : IGitHubService
         $"repos/{owner}/{repository}/pulls/{pullRequestNumber}";
 
         // --------------------------------------------------------
-        // Get pull request metadata
+        // Get PR metadata
         // --------------------------------------------------------
 
         using var pullRequestResponse =
@@ -123,7 +113,7 @@ public sealed class GitHubService : IGitHubService
         var headSha = githubPullRequest.Head.Sha;
 
         // --------------------------------------------------------
-        // Get pull request diff
+        // Get PR diff
         // --------------------------------------------------------
 
         using var diffResponse =
@@ -184,8 +174,7 @@ public sealed class GitHubService : IGitHubService
         if (string.IsNullOrWhiteSpace(pullRequest.HeadSha))
         {
             throw new InvalidOperationException(
-            "Pull request head SHA is empty. " +
-            "GitHub requires a valid commit SHA when creating a review.");
+            "Pull request head SHA is empty.");
         }
 
         if (findings is null)
@@ -203,7 +192,7 @@ public sealed class GitHubService : IGitHubService
         }
 
         // --------------------------------------------------------
-        // Retrieve existing comments
+        // Get ALL existing PR review comments
         // --------------------------------------------------------
 
         var existingComments =
@@ -214,80 +203,97 @@ public sealed class GitHubService : IGitHubService
         var newComments =
         new List<GitHubReviewCommentRequest>();
 
-        var alreadyProcessedMarkers =
+        // --------------------------------------------------------
+        // Prevent duplicate findings from Gemini response
+        // --------------------------------------------------------
+
+        var processedFindingKeys =
         new HashSet<string>(
-        StringComparer.Ordinal);
+        StringComparer.OrdinalIgnoreCase);
 
         // --------------------------------------------------------
-        // Filter duplicate findings
+        // Process findings
         // --------------------------------------------------------
 
         foreach (var finding in validFindings)
         {
-            var marker =
-            CreateCommentMarker(
-            finding,
-            pullRequest.HeadSha);
+            // Stable key based on FILE + LINE.
+            //
+            // IMPORTANT:
+            // Do NOT include:
+            // - HEAD SHA
+            // - AI issue text
+            //
+            // because both can change between reviews.
+            var findingKey =
+            CreateFindingKey(finding);
 
-            // Avoid duplicate findings within the same AI response.
-            if (!alreadyProcessedMarkers.Add(marker))
+            // ----------------------------------------------------
+            // Duplicate inside the SAME AI response
+            // ----------------------------------------------------
+
+            if (!processedFindingKeys.Add(findingKey))
             {
                 continue;
             }
 
-            // Avoid comments already posted by this bot for the same finding.
-            // We match using the finding fingerprint so that comments created
-            // on earlier commits (different head SHA) are still detected and
-            // prevent reposting the same finding when it has not been fixed.
-            var fingerprint = CreateFindingFingerprint(finding);
+            // ----------------------------------------------------
+            // Duplicate already posted to GitHub
+            // ----------------------------------------------------
 
             var commentAlreadyExists =
-            existingComments.Any(
-            existingComment =>
-            !string.IsNullOrWhiteSpace(
-            existingComment.Body) &&
-            existingComment.Body.Contains(
-            fingerprint,
-            StringComparison.OrdinalIgnoreCase));
+            existingComments.Any(existingComment =>
+            IsSameBotComment(
+            existingComment,
+            finding,
+            findingKey));
 
             if (commentAlreadyExists)
             {
                 continue;
             }
 
-            var side = NormalizeSide(finding.Side);
+            // ----------------------------------------------------
+            // Create new GitHub comment
+            // ----------------------------------------------------
 
             newComments.Add(
             new GitHubReviewCommentRequest
             {
                 Body = BuildReviewComment(
             finding,
-            pullRequest.HeadSha),
+            findingKey),
 
                 Path = finding.FilePath.Trim(),
 
                 Line = finding.LineNumber,
 
-                Side = side
+                Side = NormalizeSide(finding.Side)
             });
         }
 
-        // No new comments need to be posted.
+        // --------------------------------------------------------
+        // Nothing new to post
+        // --------------------------------------------------------
+
         if (newComments.Count == 0)
         {
             return;
         }
 
         // --------------------------------------------------------
-        // Create one review containing all new comments
+        // Create ONE GitHub review containing all comments
         // --------------------------------------------------------
 
         var reviewRequest =
         new GitHubReviewRequest
         {
             Body = "🤖 AI Code Review",
+
             CommitId = pullRequest.HeadSha,
+
             Event = "COMMENT",
+
             Comments = newComments
         };
 
@@ -338,7 +344,105 @@ public sealed class GitHubService : IGitHubService
     }
 
     // ============================================================
-    // Get existing pull request review comments
+    // Determine whether existing comment belongs to this bot
+    // ============================================================
+
+    private static bool IsSameBotComment(
+    GitHubExistingComment existingComment,
+    ReviewFinding finding,
+    string findingKey)
+    {
+        if (string.IsNullOrWhiteSpace(
+        existingComment.Body))
+        {
+            return false;
+        }
+
+        // --------------------------------------------------------
+        // 1. Check our exact fingerprint marker
+        // --------------------------------------------------------
+
+        var marker =
+        $"PRReviewBot-Fingerprint:{findingKey}";
+
+        if (existingComment.Body.Contains(
+        marker,
+        StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // --------------------------------------------------------
+        // 2. Ignore comments that are not created by our bot
+        // --------------------------------------------------------
+
+        var isOurComment =
+        existingComment.Body.Contains(
+        "🤖 **AI Code Review**",
+        StringComparison.OrdinalIgnoreCase);
+
+        if (!isOurComment)
+        {
+            return false;
+        }
+
+        // --------------------------------------------------------
+        // 3. Same file?
+        // --------------------------------------------------------
+
+        if (string.IsNullOrWhiteSpace(
+        existingComment.Path))
+        {
+            return false;
+        }
+
+        if (!string.Equals(
+        existingComment.Path.Trim(),
+        finding.FilePath.Trim(),
+        StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // --------------------------------------------------------
+        // 4. Determine GitHub line
+        // --------------------------------------------------------
+
+        var existingLine =
+        existingComment.Line ??
+        existingComment.OriginalLine;
+
+        if (!existingLine.HasValue)
+        {
+            return false;
+        }
+
+        // --------------------------------------------------------
+        // 5. Allow small line movement
+        //
+        // Example:
+        //
+        // Previous comment -> line 34
+        // Current finding -> line 35
+        //
+        // Still considered the same location.
+        // --------------------------------------------------------
+
+        var lineDifference =
+        Math.Abs(
+        existingLine.Value -
+        finding.LineNumber);
+
+        if (lineDifference <= 2)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    // ============================================================
+    // Get existing PR review comments
     // ============================================================
 
     private async Task<List<GitHubExistingComment>>
@@ -441,7 +545,7 @@ public sealed class GitHubService : IGitHubService
     }
 
     // ============================================================
-    // Validate AI finding
+    // Validate finding
     // ============================================================
 
     private static bool IsValidFinding(
@@ -473,7 +577,7 @@ public sealed class GitHubService : IGitHubService
     }
 
     // ============================================================
-    // Normalize GitHub comment side
+    // Normalize GitHub side
     // ============================================================
 
     private static string NormalizeSide(
@@ -488,56 +592,38 @@ public sealed class GitHubService : IGitHubService
     }
 
     // ============================================================
-    // Create unique finding marker
+    // Create stable finding key
     // ============================================================
 
-    private static string CreateCommentMarker(
-    ReviewFinding finding,
-    string headSha)
-    {
-        var fingerprint =
-        CreateFindingFingerprint(finding);
-
-        return
-        $"<!-- PRReviewBot:{headSha}:{fingerprint} -->";
-    }
-
-    // ============================================================
-    // Create SHA-256 fingerprint for a finding
-    // ============================================================
-
-    private static string CreateFindingFingerprint(
+    private static string CreateFindingKey(
     ReviewFinding finding)
     {
         var canonicalValue =
         $"{finding.FilePath.Trim().ToLowerInvariant()}|" +
-        $"{finding.LineNumber}|" +
-        $"{finding.Issue.Trim().ToLowerInvariant()}";
+        $"{finding.LineNumber}";
 
         var inputBytes =
-        Encoding.UTF8.GetBytes(canonicalValue);
+        Encoding.UTF8.GetBytes(
+        canonicalValue);
 
         var hashBytes =
         SHA256.HashData(inputBytes);
 
-        return Convert.ToHexString(hashBytes);
+        return Convert.ToHexString(
+        hashBytes);
     }
 
     // ============================================================
-    // Build GitHub comment body
+    // Build review comment
     // ============================================================
 
     private static string BuildReviewComment(
     ReviewFinding finding,
-    string headSha)
+    string findingKey)
     {
-        var marker =
-        CreateCommentMarker(
-        finding,
-        headSha);
-
         return $"""
-{marker}
+<!-- PRReviewBot -->
+<!-- PRReviewBot-Fingerprint:{findingKey} -->
 
 🤖 **AI Code Review**
 
@@ -560,7 +646,7 @@ Generated by PRReviewBot
     }
 
     // ============================================================
-    // GitHub response/request models
+    // GitHub response models
     // ============================================================
 
     private sealed class GitHubPullRequestResponse
@@ -574,6 +660,10 @@ Generated by PRReviewBot
         [JsonPropertyName("sha")]
         public string? Sha { get; set; }
     }
+
+    // ============================================================
+    // GitHub review request
+    // ============================================================
 
     private sealed class GitHubReviewRequest
     {
@@ -590,6 +680,10 @@ Generated by PRReviewBot
         public List<GitHubReviewCommentRequest> Comments { get; set; } = [];
     }
 
+    // ============================================================
+    // GitHub review comment request
+    // ============================================================
+
     private sealed class GitHubReviewCommentRequest
     {
         [JsonPropertyName("body")]
@@ -605,6 +699,10 @@ Generated by PRReviewBot
         public string Side { get; set; } = "RIGHT";
     }
 
+    // ============================================================
+    // Existing GitHub comment
+    // ============================================================
+
     private sealed class GitHubExistingComment
     {
         [JsonPropertyName("body")]
@@ -615,6 +713,9 @@ Generated by PRReviewBot
 
         [JsonPropertyName("line")]
         public int? Line { get; set; }
+
+        [JsonPropertyName("original_line")]
+        public int? OriginalLine { get; set; }
 
         [JsonPropertyName("side")]
         public string? Side { get; set; }
