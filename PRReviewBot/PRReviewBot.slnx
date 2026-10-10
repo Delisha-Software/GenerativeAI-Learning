@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="PRReviewBot.Api/PRReviewBot.Api.csproj" />
+  <Project Path="PRReviewBot.Application/PRReviewBot.Application.csproj" />
+  <Project Path="PRReviewBot.Infrastructure/PRReviewBot.Infrastructure.csproj" />
+</Solution>

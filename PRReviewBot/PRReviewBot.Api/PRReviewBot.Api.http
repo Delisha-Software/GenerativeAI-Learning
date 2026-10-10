@@ -1,0 +1,6 @@
+@PRReviewBot.Api_HostAddress = http://localhost:5266
+
+GET {{PRReviewBot.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
